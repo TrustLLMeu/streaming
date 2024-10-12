@@ -3,6 +3,7 @@
 
 """A mid-epoch-resumable streaming/caching pytorch IterableDataset."""
 
+import hashlib
 import json
 import logging
 import mmap
@@ -855,7 +856,104 @@ class StreamingDataset(Array, IterableDataset):
         data = data.encode('utf-8')
         self._resume_shm.buf[:len(data)] = data
 
-    def resample_streams(
+    def _get_resample_streams_cache_path(
+            self,
+            epoch: int,
+            stream_id: Optional[int],
+    ) -> Optional[str]:
+        cache_root = os.getenv("STREAMING_SAMPLE_ID_CACHE")
+        if cache_root is None:
+            return None
+
+        stream_ids = (
+            tuple(range(self.num_streams))
+            if stream_id is None
+            else (stream_id,)
+        )
+        resampling_streams = [
+            self.streams[stream_id_]
+            for stream_id_ in stream_ids
+        ]
+        values_to_hash = (
+            epoch,
+            stream_ids,
+            self.shuffle_seed,
+            self.sampling_method,
+            self.sampling_granularity,
+            self.shard_offset_per_stream.tolist(),
+            self.shards_per_stream.tolist(),
+            self.samples_per_shard.tolist(),
+            self.sample_offset_per_shard.tolist(),
+            tuple(
+                (stream.remote, stream.local)
+                for stream in resampling_streams
+            ),
+        )
+        cache_hash = hashlib.md5(json.dumps(values_to_hash).encode('utf-8')).hexdigest()
+        node = self._unique_worker_world.node
+        return (
+            os.path.join(cache_root, f'shuffle_units_{node}_{cache_hash}.npy'),
+            os.path.join(cache_root, f'sample_ids_{node}_{cache_hash}.npy'),
+        )
+
+    def _use_resample_streams_cache(
+            self,
+            epoch: int,
+            stream_id: Optional[int],
+    ) -> Tuple[NDArray[np.int64], NDArray[np.int64]]:
+        cache_paths = self._get_resample_streams_cache_path(epoch, stream_id)
+        use_cache = cache_paths is not None
+        if use_cache:
+            (shuffle_units_path, sample_ids_path) = cache_paths
+
+        if (
+                use_cache
+                and os.path.isfile(shuffle_units_path)
+                and os.path.isfile(sample_ids_path)
+        ):
+            # Cache hit!
+            shuffle_units = np.load(shuffle_units_path)
+            sample_ids = np.load(sample_ids_path)
+        else:
+            assert self._unique_worker_world.is_local_leader, \
+                'resampling was called from non-local leader'
+            # No cache hit!
+            if not use_cache or self._unique_worker_world.is_local_leader:
+                shuffle_units, sample_ids = self._resample_streams(
+                    epoch,
+                    stream_id,
+                )
+                if use_cache:
+                    node = self._unique_worker_world.node
+                    writelock = FileLock(
+                        os.path.join(os.path.dirname(cache_paths[0]), f'write_resamples_{node}.lock'),
+                    )
+                    # Write
+                    with writelock:
+                        os.makedirs(
+                            os.path.dirname(shuffle_units_path),
+                            exist_ok=True,
+                        )
+                        # Ensure another job isn't writing to the locations already.
+                        if not os.path.isfile(shuffle_units_path):
+                            np.save(
+                                shuffle_units_path,
+                                shuffle_units,
+                                allow_pickle=False,
+                            )
+                        if not os.path.isfile(sample_ids_path):
+                            np.save(
+                                sample_ids_path,
+                                sample_ids,
+                                allow_pickle=False,
+                            )
+            else:
+                shuffle_units = np.load(shuffle_units_path)
+                sample_ids = np.load(sample_ids_path)
+
+        return shuffle_units, sample_ids
+
+    def _resample_streams(
             self,
             epoch: int,
             stream_id: Optional[int] = None) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
@@ -935,6 +1033,22 @@ class StreamingDataset(Array, IterableDataset):
         shuffle_units = np.concatenate(shuffle_units).astype(np.int64)
         sample_ids = np.concatenate(sample_ids).astype(np.int64)
         return shuffle_units, sample_ids
+
+    def resample_streams(
+            self,
+            epoch: int,
+            stream_id: Optional[int] = None) -> Tuple[NDArray[np.int64], NDArray[np.int64]]:
+        """Perform the up/down-sampling needed to generate the weighted epoch.
+
+        Args:
+            epoch (int): What epoch this is for. Used in seeding the sampling RNG.
+            stream_id (Optional[int]): Which stream to resample. If ``None``, resample all streams.
+                Defaults to ``None``.
+
+        Returns:
+            Tuple[NDArray[np.int64], NDArray[np.int64]]: Sampled shard sizes and sample mapping.
+        """
+        return self._use_resample_streams_cache(epoch, stream_id)
 
     def _share_work(
         self,
