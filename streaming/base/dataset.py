@@ -900,7 +900,7 @@ class StreamingDataset(Array, IterableDataset):
             self,
             epoch: int,
             stream_id: Optional[int],
-    ) -> Tuple[NDArray[np.int64], NDArray[np.int64]]:
+    ) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
         cache_paths = self._get_resample_streams_cache_path(epoch, stream_id)
         use_cache = cache_paths is not None
         if use_cache:
@@ -1037,7 +1037,7 @@ class StreamingDataset(Array, IterableDataset):
     def resample_streams(
             self,
             epoch: int,
-            stream_id: Optional[int] = None) -> Tuple[NDArray[np.int64], NDArray[np.int64]]:
+            stream_id: Optional[int] = None) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
         """Perform the up/down-sampling needed to generate the weighted epoch.
 
         Args:
